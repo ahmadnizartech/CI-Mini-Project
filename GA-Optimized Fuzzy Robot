@@ -1,0 +1,729 @@
+"""
+GA-Optimized Fuzzy Robot Navigation System
+Uses Genetic Algorithm to evolve optimal fuzzy logic parameters
+Press 'G' to start evolution, 'E' to deploy evolved robot
+Press 'S' to save, 'L' to load evolved genomes
+Press 'F' to toggle Default/Evolved genome mode
+Each map remembers its own optimal genome
+"""
+
+import pygame
+import math
+import numpy as np
+import skfuzzy as fuzz
+from skfuzzy import control as ctrl
+import warnings
+import random
+import copy
+import json
+
+warnings.filterwarnings('ignore')
+
+# === CONFIGURATION ===
+WIN_W, WIN_H = 1280, 720
+MAP_W, MAP_H = 900, 720
+PANEL_W = WIN_W - MAP_W
+FPS = 60
+ROBOT_R = 15
+SENSOR_RANGE = 250
+SENSOR_ANGLES = [-90, -50, -25, 0, 25, 50, 90]
+GOAL_THRESH = 30
+
+# GA Parameters
+POPULATION_SIZE = 20
+GENERATIONS = 15
+MUTATION_RATE = 0.15
+ELITE_COUNT = 4
+MAX_STEPS_PER_EVAL = 500
+
+# Colors
+COL_BG = (30, 33, 40)
+COL_MAP = (245, 247, 250)
+COL_ACCENT = (0, 173, 181)
+COL_TEXT = (238, 238, 238)
+COL_WARN = (255, 87, 34)
+COL_OK = (0, 200, 83)
+COL_GA = (156, 39, 176)
+COL_DEFAULT = (255, 152, 0)
+
+# === MAP DATA ===
+MAPS = {
+    "Training Room": {
+        "start": (60, 620), "goal": (820, 80),
+        "obstacles": [
+            pygame.Rect(200, 250, 30, 470), pygame.Rect(450, 0, 30, 450),
+            pygame.Rect(700, 250, 30, 470),
+            pygame.Rect(0, 0, MAP_W, 10), pygame.Rect(0, MAP_H - 10, MAP_W, 10),
+            pygame.Rect(0, 0, 10, MAP_H), pygame.Rect(MAP_W - 10, 0, 10, MAP_H)
+        ]
+    },
+    "Maze Complex": {
+        "start": (60, 60), "goal": (820, 620),
+        "obstacles": [
+            pygame.Rect(250, 50, 30, 250), pygame.Rect(500, 350, 30, 320),
+            pygame.Rect(0, 0, MAP_W, 10), pygame.Rect(0, MAP_H - 10, MAP_W, 10),
+            pygame.Rect(0, 0, 10, MAP_H), pygame.Rect(MAP_W - 10, 0, 10, MAP_H)
+        ]
+    },
+    "Open Field": {
+        "start": (60, 360), "goal": (820, 360),
+        "obstacles": [
+            pygame.Rect(300, 200, 80, 80), pygame.Rect(500, 420, 80, 80),
+            pygame.Rect(600, 150, 80, 80), pygame.Rect(400, 300, 40, 40),
+            pygame.Rect(0, 0, MAP_W, 10), pygame.Rect(0, MAP_H - 10, MAP_W, 10),
+            pygame.Rect(0, 0, 10, MAP_H), pygame.Rect(MAP_W - 10, 0, 10, MAP_H)
+        ]
+    }
+}
+
+
+class Genome:
+    """Represents a set of parameters for the fuzzy controller"""
+
+    def __init__(self, random_init=True):
+        if random_init:
+            self.sensitivity = random.uniform(60, 150)
+            self.turn_power = random.uniform(15, 50)
+            self.goal_force = random.uniform(0.01, 0.4)
+            self.speed = random.uniform(3.0, 6.0)
+            self.goal_override_dist = random.uniform(60, 150)
+            self.goal_override_threshold = random.uniform(15, 40)
+            self.stuck_threshold = random.uniform(15, 35)
+        else:
+            # Default values
+            self.sensitivity = 100
+            self.turn_power = 30
+            self.goal_force = 0.15
+            self.speed = 4.5
+            self.goal_override_dist = 100
+            self.goal_override_threshold = 20
+            self.stuck_threshold = 20
+
+        self.fitness = 0
+
+    def mutate(self):
+        """Apply random mutations"""
+        if random.random() < MUTATION_RATE:
+            self.sensitivity += random.gauss(0, 15)
+            self.sensitivity = np.clip(self.sensitivity, 60, 150)
+        if random.random() < MUTATION_RATE:
+            self.turn_power += random.gauss(0, 5)
+            self.turn_power = np.clip(self.turn_power, 15, 50)
+        if random.random() < MUTATION_RATE:
+            self.goal_force += random.gauss(0, 0.05)
+            self.goal_force = np.clip(self.goal_force, 0.01, 0.4)
+        if random.random() < MUTATION_RATE:
+            self.speed += random.gauss(0, 0.5)
+            self.speed = np.clip(self.speed, 3.0, 6.0)
+        if random.random() < MUTATION_RATE:
+            self.goal_override_dist += random.gauss(0, 15)
+            self.goal_override_dist = np.clip(self.goal_override_dist, 60, 150)
+        if random.random() < MUTATION_RATE:
+            self.goal_override_threshold += random.gauss(0, 5)
+            self.goal_override_threshold = np.clip(self.goal_override_threshold, 15, 40)
+        if random.random() < MUTATION_RATE:
+            self.stuck_threshold += random.gauss(0, 5)
+            self.stuck_threshold = np.clip(self.stuck_threshold, 15, 35)
+
+    def crossover(self, other):
+        """Create offspring from two parents"""
+        child = Genome(random_init=False)
+        # Uniform crossover
+        child.sensitivity = self.sensitivity if random.random() < 0.5 else other.sensitivity
+        child.turn_power = self.turn_power if random.random() < 0.5 else other.turn_power
+        child.goal_force = self.goal_force if random.random() < 0.5 else other.goal_force
+        child.speed = self.speed if random.random() < 0.5 else other.speed
+        child.goal_override_dist = self.goal_override_dist if random.random() < 0.5 else other.goal_override_dist
+        child.goal_override_threshold = self.goal_override_threshold if random.random() < 0.5 else other.goal_override_threshold
+        child.stuck_threshold = self.stuck_threshold if random.random() < 0.5 else other.stuck_threshold
+        return child
+
+
+def save_genomes(evolved_genomes, filename="evolved_genomes.json"):
+    """Save evolved genomes to a JSON file"""
+    data = {}
+    for map_name, genome in evolved_genomes.items():
+        if genome is not None:
+            data[map_name] = {
+                'sensitivity': genome.sensitivity,
+                'turn_power': genome.turn_power,
+                'goal_force': genome.goal_force,
+                'speed': genome.speed,
+                'goal_override_dist': genome.goal_override_dist,
+                'goal_override_threshold': genome.goal_override_threshold,
+                'stuck_threshold': genome.stuck_threshold,
+                'fitness': genome.fitness
+            }
+
+    try:
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"\n{'='*60}")
+        print(f"✓ Genomes saved to {filename}")
+        print(f"{'='*60}")
+        for map_name, params in data.items():
+            print(f"\n{map_name}:")
+            print(f"  Sensitivity: {params['sensitivity']:.2f}")
+            print(f"  Turn Power: {params['turn_power']:.2f}")
+            print(f"  Goal Force: {params['goal_force']:.3f}")
+            print(f"  Speed: {params['speed']:.2f}")
+            print(f"  Goal Override Dist: {params['goal_override_dist']:.2f}")
+            print(f"  Goal Override Threshold: {params['goal_override_threshold']:.2f}")
+            print(f"  Stuck Threshold: {params['stuck_threshold']:.2f}")
+            print(f"  Fitness: {params['fitness']:.2f}")
+        print(f"\n{'='*60}\n")
+        return True
+    except Exception as e:
+        print(f"✗ Error saving genomes: {e}")
+        return False
+
+
+def load_genomes(filename="evolved_genomes.json"):
+    """Load evolved genomes from a JSON file"""
+    evolved_genomes = {
+        "Training Room": None,
+        "Maze Complex": None,
+        "Open Field": None
+    }
+
+    try:
+        with open(filename, 'r') as f:
+            data = json.load(f)
+
+        for map_name, params in data.items():
+            if map_name in evolved_genomes:
+                genome = Genome(random_init=False)
+                genome.sensitivity = params['sensitivity']
+                genome.turn_power = params['turn_power']
+                genome.goal_force = params['goal_force']
+                genome.speed = params['speed']
+                genome.goal_override_dist = params['goal_override_dist']
+                genome.goal_override_threshold = params['goal_override_threshold']
+                genome.stuck_threshold = params['stuck_threshold']
+                genome.fitness = params['fitness']
+                evolved_genomes[map_name] = genome
+
+        print(f"\n{'='*60}")
+        print(f"✓ Genomes loaded from {filename}")
+        print(f"{'='*60}")
+        for map_name, genome in evolved_genomes.items():
+            if genome:
+                print(f"\n{map_name}:")
+                print(f"  Sensitivity: {genome.sensitivity:.2f}")
+                print(f"  Turn Power: {genome.turn_power:.2f}")
+                print(f"  Goal Force: {genome.goal_force:.3f}")
+                print(f"  Speed: {genome.speed:.2f}")
+                print(f"  Fitness: {genome.fitness:.2f}")
+        print(f"\n{'='*60}\n")
+        return evolved_genomes
+    except FileNotFoundError:
+        print(f"✗ No saved genomes found at {filename}")
+        return evolved_genomes
+    except Exception as e:
+        print(f"✗ Error loading genomes: {e}")
+        return evolved_genomes
+
+
+class FuzzyController:
+    def __init__(self, genome):
+        self.genome = genome
+        self.turn_power = genome.turn_power
+
+        # Inputs
+        self.d_L = ctrl.Antecedent(np.arange(0, SENSOR_RANGE + 1, 1), 'd_L')
+        self.d_F = ctrl.Antecedent(np.arange(0, SENSOR_RANGE + 1, 1), 'd_F')
+        self.d_R = ctrl.Antecedent(np.arange(0, SENSOR_RANGE + 1, 1), 'd_R')
+        self.goal = ctrl.Antecedent(np.arange(-180, 181, 1), 'goal')
+
+        # Output
+        self.turn = ctrl.Consequent(np.arange(-self.turn_power, self.turn_power + 0.5, 0.5), 'turn')
+
+        # Membership functions using genome's sensitivity
+        vn = genome.sensitivity * 0.3
+        n = genome.sensitivity * 0.6
+        m = genome.sensitivity * 0.9
+        f = genome.sensitivity * 1.5
+
+        for d in [self.d_L, self.d_F, self.d_R]:
+            d['near'] = fuzz.trapmf(d.universe, [0, 0, vn, n])
+            d['medium'] = fuzz.trapmf(d.universe, [vn, m, f, f * 1.2])
+            d['far'] = fuzz.trapmf(d.universe, [m, f, SENSOR_RANGE, SENSOR_RANGE])
+
+        self.goal['left'] = fuzz.trimf(self.goal.universe, [-180, -90, 0])
+        self.goal['ahead'] = fuzz.trimf(self.goal.universe, [-30, 0, 30])
+        self.goal['right'] = fuzz.trimf(self.goal.universe, [0, 90, 180])
+
+        tp = self.turn_power
+        self.turn['hard_left'] = fuzz.trimf(self.turn.universe, [-tp, -tp, -tp * 0.5])
+        self.turn['left'] = fuzz.trimf(self.turn.universe, [-tp * 0.7, -tp * 0.3, 0])
+        self.turn['straight'] = fuzz.trimf(self.turn.universe, [-tp * 0.1, 0, tp * 0.1])
+        self.turn['right'] = fuzz.trimf(self.turn.universe, [0, tp * 0.3, tp * 0.7])
+        self.turn['hard_right'] = fuzz.trimf(self.turn.universe, [tp * 0.5, tp, tp])
+
+        rules = [
+            ctrl.Rule(self.d_F['near'], self.turn['hard_left']),
+            ctrl.Rule(self.d_F['near'] & self.d_L['near'], self.turn['hard_right']),
+            ctrl.Rule(self.d_L['near'] & self.d_F['far'], self.turn['hard_right']),
+            ctrl.Rule(self.d_R['near'] & self.d_F['far'], self.turn['hard_left']),
+            ctrl.Rule(self.d_F['far'] & self.goal['left'], self.turn['left']),
+            ctrl.Rule(self.d_F['far'] & self.goal['right'], self.turn['right']),
+            ctrl.Rule(self.d_F['far'] & self.goal['ahead'], self.turn['straight']),
+        ]
+
+        self.ctrl_sys = ctrl.ControlSystem(rules)
+        self.sim = ctrl.ControlSystemSimulation(self.ctrl_sys)
+
+    def compute(self, sensors, goal_ang):
+        s_left = min(sensors[0], sensors[1])
+        s_front = min(sensors[2], sensors[3], sensors[4])
+        s_right = min(sensors[5], sensors[6])
+
+        try:
+            self.sim.input['d_L'] = np.clip(s_left, 0, SENSOR_RANGE)
+            self.sim.input['d_F'] = np.clip(s_front, 0, SENSOR_RANGE)
+            self.sim.input['d_R'] = np.clip(s_right, 0, SENSOR_RANGE)
+            self.sim.input['goal'] = np.clip(goal_ang, -180, 180)
+            self.sim.compute()
+            return self.sim.output['turn'], (s_left, s_front, s_right)
+        except:
+            return -self.turn_power if s_left > s_right else self.turn_power, (s_left, s_front, s_right)
+
+
+class Robot:
+    def __init__(self, start, goal, genome):
+        self.x, self.y = start
+        self.gx, self.gy = goal
+        self.angle = 0
+        self.genome = genome
+        self.speed = genome.speed
+        self.ctrl = FuzzyController(genome)
+
+        self.path = []
+        self.sensors = [SENSOR_RANGE] * 7
+        self.ray_points = []
+        self.fuzzy_inputs = (0, 0, 0)
+        self.current_turn = 0
+        self.goal_angle_diff = 0
+        self.reached = False
+        self.crashed = False
+        self.steps = 0
+        self.collisions = 0
+        self.cooldown = 0
+        self.stuck_counter = 0
+        self.last_position = (self.x, self.y)
+
+    def cast_ray(self, angle_offset, obs):
+        rad = math.radians(self.angle + angle_offset)
+        dx, dy = math.cos(rad), math.sin(rad)
+        for d in range(0, SENSOR_RANGE, 5):
+            tx = self.x + dx * d
+            ty = self.y + dy * d
+            if not (0 <= tx <= MAP_W and 0 <= ty <= MAP_H) or any(o.collidepoint(tx, ty) for o in obs):
+                return d, (tx, ty)
+        return SENSOR_RANGE, (self.x + dx * SENSOR_RANGE, self.y + dy * SENSOR_RANGE)
+
+    def update(self, obs):
+        if self.reached or self.crashed:
+            return
+        self.steps += 1
+
+        if self.steps % 30 == 0:
+            dist_moved = math.hypot(self.x - self.last_position[0], self.y - self.last_position[1])
+            if dist_moved < self.genome.stuck_threshold:
+                self.stuck_counter += 1
+            else:
+                self.stuck_counter = 0
+            self.last_position = (self.x, self.y)
+
+        raw_readings = []
+        self.ray_points = []
+        for a in SENSOR_ANGLES:
+            d, pt = self.cast_ray(a, obs)
+            raw_readings.append(d)
+            self.ray_points.append(pt)
+        self.sensors = raw_readings
+
+        target_ang = math.degrees(math.atan2(self.gy - self.y, self.gx - self.x))
+        self.goal_angle_diff = (target_ang - self.angle + 180) % 360 - 180
+        dist_to_goal = math.hypot(self.x - self.gx, self.y - self.gy)
+
+        # Fuzzy logic control
+        if self.stuck_counter > 2:
+            closest_side = min([(self.sensors[0], -1), (self.sensors[6], 1)], key=lambda x: x[0])
+            turn = self.ctrl.turn_power * closest_side[1]
+            self.fuzzy_inputs = (SENSOR_RANGE, SENSOR_RANGE, SENSOR_RANGE)
+            self.stuck_counter = 0
+        elif dist_to_goal < self.genome.goal_override_dist and min(
+                self.sensors[2:5]) > self.genome.goal_override_threshold:
+            turn = np.clip(self.goal_angle_diff * 0.8, -self.ctrl.turn_power, self.ctrl.turn_power)
+            self.fuzzy_inputs = (SENSOR_RANGE, SENSOR_RANGE, SENSOR_RANGE)
+        else:
+            turn, self.fuzzy_inputs = self.ctrl.compute(self.sensors, self.goal_angle_diff)
+            if min(self.fuzzy_inputs) > 60:
+                turn += self.goal_angle_diff * self.genome.goal_force
+
+        self.current_turn = turn
+
+        if self.cooldown > 0:
+            self.x -= 3 * math.cos(math.radians(self.angle))
+            self.y -= 3 * math.sin(math.radians(self.angle))
+            self.cooldown -= 1
+        else:
+            self.angle += self.current_turn
+            self.x += self.speed * math.cos(math.radians(self.angle))
+            self.y += self.speed * math.sin(math.radians(self.angle))
+            self.path.append((self.x, self.y))
+
+        rect = pygame.Rect(self.x - ROBOT_R, self.y - ROBOT_R, ROBOT_R * 2, ROBOT_R * 2)
+        if any(o.colliderect(rect) for o in obs):
+            self.collisions += 1
+            self.cooldown = 10
+            if self.collisions > 20:
+                self.crashed = True
+
+        if dist_to_goal < GOAL_THRESH:
+            self.reached = True
+
+    def draw(self, surf, show_sensors=True):
+        if show_sensors:
+            for pt in self.ray_points:
+                pygame.draw.line(surf, (255, 50, 50), (self.x, self.y), pt, 1)
+        if len(self.path) > 1:
+            pygame.draw.lines(surf, COL_ACCENT, False, self.path, 2)
+        pygame.draw.circle(surf, (50, 50, 50), (int(self.x), int(self.y)), ROBOT_R)
+        pygame.draw.circle(surf, COL_ACCENT, (int(self.x), int(self.y)), ROBOT_R, 2)
+        hx = self.x + ROBOT_R * math.cos(math.radians(self.angle))
+        hy = self.y + ROBOT_R * math.sin(math.radians(self.angle))
+        pygame.draw.line(surf, COL_ACCENT, (self.x, self.y), (hx, hy), 3)
+
+
+class GeneticAlgorithm:
+    def __init__(self, map_key):
+        self.map_key = map_key
+        self.population = [Genome() for _ in range(POPULATION_SIZE)]
+        self.generation = 0
+        self.best_genome = None
+        self.fitness_history = []
+        self.generation_fitness_scores = []
+
+    def evaluate_genome(self, genome, obstacles, start, goal):
+        """Evaluate a genome's fitness"""
+        robot = Robot(start, goal, genome)
+
+        for _ in range(MAX_STEPS_PER_EVAL):
+            robot.update(obstacles)
+            if robot.reached or robot.crashed:
+                break
+
+        # Fitness calculation
+        dist_to_goal = math.hypot(robot.x - robot.gx, robot.y - robot.gy)
+
+        fitness = 0
+        if robot.reached:
+            fitness = 10000 - robot.steps - robot.collisions * 50
+        else:
+            fitness = 1000 - dist_to_goal - robot.collisions * 100 - robot.steps * 0.5
+
+        genome.fitness = max(0, fitness)
+        return robot
+
+    def evolve_generation(self, obstacles, start, goal):
+        """Run one generation of evolution"""
+        # Evaluate all genomes
+        for genome in self.population:
+            self.evaluate_genome(genome, obstacles, start, goal)
+
+        # Sort by fitness
+        self.population.sort(key=lambda g: g.fitness, reverse=True)
+
+        # Track best
+        self.best_genome = copy.deepcopy(self.population[0])
+        avg_fitness = sum(g.fitness for g in self.population) / len(self.population)
+        self.fitness_history.append((self.best_genome.fitness, avg_fitness))
+
+        # Store all fitness scores for current generation
+        current_gen_scores = [g.fitness for g in self.population]
+        self.generation_fitness_scores.append(current_gen_scores)
+
+        # Create next generation
+        new_population = []
+
+        # Elitism - keep best performers
+        for i in range(ELITE_COUNT):
+            new_population.append(copy.deepcopy(self.population[i]))
+
+        # Crossover and mutation
+        while len(new_population) < POPULATION_SIZE:
+            parent1 = self.tournament_select()
+            parent2 = self.tournament_select()
+            child = parent1.crossover(parent2)
+            child.mutate()
+            new_population.append(child)
+
+        self.population = new_population
+        self.generation += 1
+
+    def tournament_select(self, tournament_size=3):
+        """Select parent using tournament selection"""
+        tournament = random.sample(self.population, tournament_size)
+        return max(tournament, key=lambda g: g.fitness)
+
+
+def draw_bar(surf, x, y, w, h, val, max_val, color, label):
+    pygame.draw.rect(surf, (50, 50, 60), (x, y, w, h), border_radius=4)
+    pct = max(0, min(1, val / max_val))
+    pygame.draw.rect(surf, color, (x, y, int(w * pct), h), border_radius=4)
+    txt = pygame.font.SysFont("Consolas", 12).render(f"{label}: {val:.0f}", True, COL_TEXT)
+    surf.blit(txt, (x + 5, y + 2))
+
+
+def main():
+    pygame.init()
+    scr = pygame.display.set_mode((WIN_W, WIN_H))
+    pygame.display.set_caption("GA-Optimized Fuzzy Robot Navigation")
+    clk = pygame.time.Clock()
+
+    map_k = "Training Room"
+
+    # Start with default genome
+    default_genome = Genome(random_init=False)
+    robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], default_genome)
+
+    ga = None
+    evolving = False
+    use_evolved = False  # Track whether using evolved or default genome
+
+    # Load previously saved genomes
+    evolved_genomes = load_genomes()
+
+    current_eval_robots = []
+    eval_index = 0
+
+    run = True
+    paused = False
+
+    while run:
+        scr.fill(COL_MAP)
+
+        for e in pygame.event.get():
+            if e.type == pygame.QUIT:
+                run = False
+            if e.type == pygame.KEYDOWN:
+                if e.key == pygame.K_SPACE:
+                    paused = not paused
+                if e.key == pygame.K_r:
+                    # Reset with current genome mode
+                    if use_evolved and evolved_genomes[map_k]:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], evolved_genomes[map_k])
+                    else:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], default_genome)
+                if e.key == pygame.K_f:
+                    # Toggle between default and evolved genome
+                    if evolved_genomes[map_k]:
+                        use_evolved = not use_evolved
+                        if use_evolved:
+                            robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], evolved_genomes[map_k])
+                            print(f"Switched to EVOLVED genome for {map_k}")
+                        else:
+                            robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], default_genome)
+                            print(f"Switched to DEFAULT genome for {map_k}")
+                    else:
+                        print(f"No evolved genome available for {map_k}. Press 'G' to evolve one!")
+                if e.key == pygame.K_1:
+                    map_k = "Training Room"
+                    if use_evolved and evolved_genomes[map_k]:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], evolved_genomes[map_k])
+                    else:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], default_genome)
+                if e.key == pygame.K_2:
+                    map_k = "Maze Complex"
+                    if use_evolved and evolved_genomes[map_k]:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], evolved_genomes[map_k])
+                    else:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], default_genome)
+                if e.key == pygame.K_3:
+                    map_k = "Open Field"
+                    if use_evolved and evolved_genomes[map_k]:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], evolved_genomes[map_k])
+                    else:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], default_genome)
+                if e.key == pygame.K_g and not evolving:
+                    # Start GA evolution
+                    ga = GeneticAlgorithm(map_k)
+                    evolving = True
+                    paused = False
+                    print(f"\nStarting evolution for {map_k}...")
+                if e.key == pygame.K_e and evolved_genomes[map_k]:
+                    # Deploy evolved robot for current map
+                    robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], evolved_genomes[map_k])
+                    use_evolved = True
+                    evolving = False
+                    print(f"Deployed evolved robot for {map_k}")
+                if e.key == pygame.K_s:
+                    # Save evolved genomes
+                    save_genomes(evolved_genomes)
+                if e.key == pygame.K_l:
+                    # Load evolved genomes
+                    evolved_genomes = load_genomes()
+                    if use_evolved and evolved_genomes[map_k]:
+                        robot = Robot(MAPS[map_k]["start"], MAPS[map_k]["goal"], evolved_genomes[map_k])
+
+        # Update logic
+        if evolving and ga:
+            if ga.generation < GENERATIONS:
+                # Visualize current generation evaluation
+                if eval_index < len(ga.population):
+                    if not current_eval_robots or current_eval_robots[0].reached or current_eval_robots[0].crashed or \
+                            current_eval_robots[0].steps >= MAX_STEPS_PER_EVAL:
+                        # Start new evaluation
+                        genome = ga.population[eval_index]
+                        test_robot = ga.evaluate_genome(genome, MAPS[map_k]["obstacles"],
+                                                        MAPS[map_k]["start"], MAPS[map_k]["goal"])
+                        current_eval_robots = [test_robot]
+                        eval_index += 1
+                    else:
+                        # Continue evaluation (showing faster)
+                        for _ in range(3):  # Speed up visualization
+                            if current_eval_robots[0].reached or current_eval_robots[0].crashed or current_eval_robots[
+                                0].steps >= MAX_STEPS_PER_EVAL:
+                                break
+                            current_eval_robots[0].update(MAPS[map_k]["obstacles"])
+                else:
+                    # Generation complete
+                    ga.evolve_generation(MAPS[map_k]["obstacles"], MAPS[map_k]["start"], MAPS[map_k]["goal"])
+                    eval_index = 0
+                    current_eval_robots = []
+
+                    if ga.generation >= GENERATIONS:
+                        evolved_genomes[map_k] = ga.best_genome
+                        evolving = False
+                        print(f"\n✓ Evolution complete for {map_k}!")
+                        print(f"  Best fitness: {ga.best_genome.fitness:.2f}")
+
+            # Draw evolution visualization
+            if current_eval_robots:
+                robot_to_draw = current_eval_robots[0]
+            else:
+                robot_to_draw = robot
+        elif not paused:
+            robot.update(MAPS[map_k]["obstacles"])
+            robot_to_draw = robot
+        else:
+            robot_to_draw = robot
+
+        # Draw Map
+        cfg = MAPS[map_k]
+        pygame.draw.circle(scr, (200, 255, 200), cfg["goal"], 30)
+        pygame.draw.circle(scr, COL_OK, cfg["goal"], 10)
+        pygame.draw.circle(scr, (200, 200, 200), cfg["start"], 10)
+        for o in cfg["obstacles"]:
+            pygame.draw.rect(scr, (40, 44, 52), o, border_radius=4)
+
+        robot_to_draw.draw(scr, show_sensors=not evolving)
+
+        # Draw Dashboard
+        pygame.draw.rect(scr, COL_BG, (MAP_W, 0, PANEL_W, WIN_H))
+        cx, cy = MAP_W + 20, 20
+        f_head = pygame.font.SysFont("Arial", 18, bold=True)
+
+        if evolving:
+            scr.blit(f_head.render("EVOLVING...", True, COL_GA), (cx, cy))
+            cy += 30
+            scr.blit(pygame.font.SysFont("Consolas", 14).render(f"Gen: {ga.generation}/{GENERATIONS}", True, COL_TEXT),
+                     (cx, cy))
+            cy += 20
+            scr.blit(
+                pygame.font.SysFont("Consolas", 14).render(f"Eval: {eval_index}/{POPULATION_SIZE}", True, COL_TEXT),
+                (cx, cy))
+            cy += 30
+
+            if ga.fitness_history:
+                best_fit, avg_fit = ga.fitness_history[-1]
+                scr.blit(pygame.font.SysFont("Consolas", 12).render(f"Best: {best_fit:.0f}", True, COL_OK), (cx, cy))
+                cy += 18
+                scr.blit(pygame.font.SysFont("Consolas", 12).render(f"Avg: {avg_fit:.0f}", True, COL_TEXT), (cx, cy))
+                cy += 30
+
+                # Display all fitness scores for current generation
+                if ga.generation_fitness_scores:
+                    scr.blit(
+                        pygame.font.SysFont("Consolas", 11, bold=True).render("Generation Fitness:", True, COL_TEXT),
+                        (cx, cy))
+                    cy += 18
+                    current_scores = ga.generation_fitness_scores[-1] if ga.generation_fitness_scores else []
+                    for i, score in enumerate(current_scores[:10]):  # Show top 10
+                        color = COL_OK if i < ELITE_COUNT else COL_TEXT
+                        scr.blit(pygame.font.SysFont("Consolas", 10).render(f"#{i + 1}: {score:.0f}", True, color),
+                                 (cx, cy))
+                        cy += 15
+                    if len(current_scores) > 10:
+                        scr.blit(
+                            pygame.font.SysFont("Consolas", 10).render(f"... ({len(current_scores) - 10} more)", True,
+                                                                       (120, 120, 120)), (cx, cy))
+                        cy += 15
+        else:
+            # Show genome mode
+            if use_evolved and evolved_genomes[map_k]:
+                mode_text = "EVOLVED"
+                mode_color = COL_GA
+            else:
+                mode_text = "DEFAULT"
+                mode_color = COL_DEFAULT
+
+            scr.blit(f_head.render(f"Genome: {mode_text}", True, mode_color), (cx, cy))
+            cy += 30
+
+        # Genome parameters
+        genome = robot_to_draw.genome
+        cy += 5
+        params = [
+            f"Sensitivity: {genome.sensitivity:.1f}",
+            f"Turn Power: {genome.turn_power:.1f}",
+            f"Goal Force: {genome.goal_force:.2f}",
+            f"Speed: {genome.speed:.1f}"
+        ]
+        for p in params:
+            scr.blit(pygame.font.SysFont("Consolas", 11).render(p, True, (180, 180, 180)), (cx, cy))
+            cy += 18
+
+        cy += 10
+        l, f, r = robot_to_draw.fuzzy_inputs
+        draw_bar(scr, cx, cy, PANEL_W - 40, 18, l, SENSOR_RANGE, (255, 200, 50), "L")
+        cy += 22
+        draw_bar(scr, cx, cy, PANEL_W - 40, 18, f, SENSOR_RANGE, (255, 100, 100), "F")
+        cy += 22
+        draw_bar(scr, cx, cy, PANEL_W - 40, 18, r, SENSOR_RANGE, (255, 200, 50), "R")
+        cy += 30
+
+        # Stats
+        stats = [
+            f"Steps: {robot_to_draw.steps}",
+            f"Collisions: {robot_to_draw.collisions}",
+            f"Status: {'GOAL!' if robot_to_draw.reached else 'CRASH!' if robot_to_draw.crashed else 'Running'}"
+        ]
+        for s in stats:
+            scr.blit(pygame.font.SysFont("Consolas", 12).render(s, True, COL_TEXT), (cx, cy))
+            cy += 18
+
+        # Controls
+        cy = WIN_H - 180
+        controls = [
+            "[F] Toggle Default/Evolved",
+            "[G] Start GA Evolution",
+            "[E] Deploy Evolved Robot",
+            "[S] Save | [L] Load",
+            "[1-3] Change Map",
+            "[SPACE] Pause | [R] Reset"
+        ]
+        for ctrl_text in controls:
+            scr.blit(pygame.font.SysFont("Consolas", 11).render(ctrl_text, True, (150, 150, 150)), (cx, cy))
+            cy += 18
+
+        pygame.display.flip()
+        clk.tick(FPS)
+
+    pygame.quit()
+
+
+if __name__ == "__main__":
+    main()
